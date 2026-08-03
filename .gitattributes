@@ -1,0 +1,9 @@
+# Shell 脚本必须保持 LF，否则在 Git Bash / WSL / Linux 下会报 bad interpreter: ...^M
+*.sh text eol=lf
+
+# Markdown 与 JSON 归一化为 LF，保证跨平台（以及各 agent 工具）读取一致
+*.md   text eol=lf
+*.json text eol=lf
+
+# PowerShell 脚本用 CRLF（Windows 原生）
+*.ps1 text eol=crlf

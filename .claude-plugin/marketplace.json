@@ -1,0 +1,33 @@
+{
+  "name": "cpp-quant-tuning",
+  "owner": {
+    "name": "lifenghao"
+  },
+  "metadata": {
+    "description": "量化交易系统开发与调优的 Agent Skills 市场",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "cpp-quant-tuning",
+      "source": "./",
+      "description": "量化交易系统开发与调优 skills（10 个）：总纲路由、热路径 C++ 微优化、内存池与 SIMD、无锁并发与 IPC、Linux 交易机系统调优、perf/TMA 性能分析、行情数据工程、交易系统业务组件、策略与数值方法、数字货币系统。附 5 个 slash command 与 1 个性能评审 subagent。",
+      "version": "1.0.0",
+      "author": {
+        "name": "lifenghao"
+      },
+      "category": "development",
+      "keywords": [
+        "quant",
+        "quantitative-trading",
+        "hft",
+        "low-latency",
+        "cpp",
+        "performance",
+        "trading-system",
+        "market-data",
+        "crypto"
+      ]
+    }
+  ]
+}
