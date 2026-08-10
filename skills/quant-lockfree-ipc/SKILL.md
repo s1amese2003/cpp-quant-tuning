@@ -163,6 +163,135 @@ std::atomic<size_t> cur;   // 读者读 buffers[cur]，写者写 buffers[1-cur] 
 
 ---
 
+## 9. 条件变量惊群（CV Thundering Herd）
+
+当 `notify_all()` 或循环 `notify_one()` 唤醒远超实际可消费任务数的线程时，**浪费的唤醒在高核数下成为主导开销**。这个问题被 `perf lock stat` 漏掉（锁持有/等待时间正常），但 `perf trace -e futex` 会暴露真相。
+
+### 识别信号
+
+**源码侧**：
+- `pthread_cond_broadcast(&cv)` 或 `cv.notify_all()` 叫醒整个线程池，但只有少量线程有活干
+- `notify_one()` 放在循环里逐个唤醒 N 个线程（O(N) 个 futex 系统调用）
+- dispatcher 无差别唤醒所有线程：`for (i = 0; i < nthreads; i++) wake(thread[i])`
+- worker 被唤醒后 `sched_yield()` 或立即重新阻塞 —— 白被叫醒
+
+**perf 侧**：
+```bash
+perf trace -e futex -p <PID> 2>&1 | grep WAKE
+# 看 freq 和 val：高频 FUTEX_WAKE + val=INT_MAX → 广播惊群；
+# 高频 val=1 bursts → notify_one 循环
+
+perf stat -e context-switches -C <isolated_cores> -a sleep 10
+# 上下文切换率随等待线程数线性增长
+```
+
+**与锁竞争的区分**：
+
+| 症状 | 锁竞争 | CV 惊群 |
+|------|--------|---------|
+| `perf top` 热符号 | `native_queued_spin_lock_slowpath` | `futex_wake`, `try_to_wake_up` |
+| `perf lock stat` wait_total | 高 | 正常 |
+| context-switch 率 | 中等 | 极高 |
+| futex WAKE 频率 | 低 | 高 |
+| IPC | 随核数缓慢下降 | 崩溃式下降（核在忙调度而非计算） |
+
+### 为什么会慢
+
+`notify_all()` 唤醒 N 个 waiter 的时间线：
+```
+t0: notify_all() → N 个线程同时变为 runnable
+t1: 所有 N 个争抢 mutex（CV 语义强制）→ 1 个获胜，N-1 个立即阻塞在 mutex 上
+t2: N-1 个失败者各付一次完整 futex 往返（唤醒→调度→尝试获取→失败→休眠）
+t3: 线程逐个被唤醒，大多数检查 predicate 后发现无工作，再次休眠
+```
+
+每次 `notify_all` 的成本：O(N) 上下文切换 + O(N) futex 系统调用 + O(N) IPI（核间中断）+ mutex cache line 的 RFO 风暴。
+
+### 修复策略
+
+**策略 1: 精确唤醒**（首选）
+只唤醒实际有工作可做的线程。如果只有 J 个 job，只唤醒 J 个 worker（用 `notify_one()` J 次或每个 worker 有独立 CV）。
+
+**策略 2: 工作窃取**
+worker 醒来后在共享队列中取任务，没取到就继续睡。适合任务数不固定的场景。
+
+**策略 3: 分层唤醒**
+先唤醒少量线程；如果仍有积压，被唤醒的线程负责唤醒下一批（级联）。
+
+### 验证
+
+修复后用 `perf trace -e futex` 确认 WAKE 频率显著下降；`perf stat -e context-switches` 确认 cs/s 降回合理水平。
+
+> 参考：`references/10-cv-thundering-herd.md`
+
+---
+
+## 10. Mutex 转读写锁（Mutex-to-RWLock）
+
+一个 mutex 保护的数据被大量线程**只读**访问（查找、搜索、状态查询），只有极少数路径写。在高核数下，所有读者在 mutex 上串行化，即使它们之间完全不冲突。
+
+### 识别信号
+
+**源码侧**：
+- `pthread_mutex_lock()` 保护的临界区，常见路径只做读操作
+- 写入只发生在罕见分支（创建新条目、插入、更新）
+- 读写比 > ~75%（这是 rwlock 开始胜出的交叉阈值）
+
+**perf 侧**：
+```bash
+# 内核 mutex：看 osq_lock（Optimistic Spin Queue，mutex 自旋阶段）
+# 用户空间 pthread mutex：看 pthread_mutex_lock / __lll_lock_wait
+perf report --stdio --no-children | grep -E 'osq_lock|mutex_lock|pthread_mutex|futex_wait'
+
+# 确认锁特征：contention 高、wait 远大于 hold
+perf lock stat -- <workload>
+```
+
+**关键信号**：IPC 随核数增加而显著下降，但用户空间的 workload 没变——多出来的 cycles 都是锁串行化开销。
+
+### 为什么会慢
+
+即使 N 个线程都只做只读操作，mutex 对每个线程都要做 LOCK CMPXCHG（RFO），把锁的 cache line 拉到 Modified 状态。每个读者必须等前一个读者释放锁后才能获取：
+
+```
+Mutex + N readers（全部串行化）：
+Thread 1: [LOCK CMPXCHG → M] read [unlock → store]
+Thread 2:  ← 等待(RFO pending) → [LOCK CMPXCHG → M] read [unlock]
+...
+Thread N:  ← 等完前面 N-1 个
+```
+
+### 修复
+
+```cpp
+// 改前
+pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_lock(&m);
+value = lookup(key);   // 只读操作
+pthread_mutex_unlock(&m);
+
+// 改后
+pthread_rwlock_t rw = PTHREAD_RWLOCK_INITIALIZER;
+pthread_rwlock_rdlock(&rw);    // 多个读者可并发
+value = lookup(key);
+pthread_rwlock_unlock(&rw);
+
+// 写路径用 wrlock（互斥）
+pthread_rwlock_wrlock(&rw);
+insert(key, value);
+pthread_rwlock_unlock(&rw);
+```
+
+### 陷阱
+
+- **rwlock 本身有开销**（内部有原子计数器），临界区极短时（< 几十 ns）rwlock 可能比 mutex 更慢。**必须实测**。
+- 写者可能被饿死（读者不断涌入）。如果写延迟也有硬性要求，考虑 `pthread_rwlockattr_setkind_np` 设置写者优先。
+- **不要**在内核态不睡眠的临界区用 `rwlock_t`（那是 spin-based 的，不是睡眠锁）；需要睡眠的内核上下文用 `rw_semaphore`。
+
+> 参考：`references/11-mutex-to-rwlock.md`
+
+---
+
 ## references/ 索引
 
 | 文件 | 内容 |
@@ -176,3 +305,5 @@ std::atomic<size_t> cur;   // 读者读 buffers[cur]，写者写 buffers[1-cur] 
 | `07-thread-safe-cache.md` | 线程安全缓存实现 |
 | `08-thread-safe-queue.md` | 线程安全队列实现 |
 | `09-sockets-tcp-udp.md` | socket 技术及 TCP/UDP |
+| `10-cv-thundering-herd.md` | 条件变量惊群：notify_all 过度唤醒的诊断与修复 |
+| `11-mutex-to-rwlock.md` | Mutex 转读写锁：读为主场景的并发优化 |

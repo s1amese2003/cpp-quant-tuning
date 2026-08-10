@@ -106,6 +106,84 @@ metadata:
 - 尾部处理（n 不是向量宽度整数倍）用标量循环或掩码指令，别忘了写测试。
 - 数据要对齐到向量宽度（32B/64B）才能用 `load_ps` 而非 `loadu_ps`；用 `alignas(64)` 或对齐分配器。
 
+### 4a. CPU 运行时分派
+
+手写 intrinsics 面临一个基本矛盾：编译时 `-march=native` 会让二进制在旧机器上崩，不用又浪费新指令。解决方案是**生成同一函数的多个 ISA 版本，运行时检测 CPU 后选最快的**。
+
+**决策树**：
+
+| 场景 | 机制 |
+|------|------|
+| 纯 C/C++ 循环，让编译器自动向量化 | **`target_clones`** |
+| 手写 `_mm_*`/`_mm256_*` intrinsics 或内联汇编 | **`__builtin_cpu_supports`** |
+| 跨编译器 / 非 x86 | `__builtin_cpu_supports`（可移植退化为 `false`） |
+
+#### 机制 A: `target_clones`（编译器驱动）
+
+编译器自动为每个 ISA 级别生成一份函数克隆体，运行时由 IFUNC resolver 选择：
+
+```c
+// 前提：函数内不要有手写 intrinsics——target_clones 不会升级已有 intrinsics
+// 必须 non-static + noinline（否则 IFUNC 不会被生成）
+#ifndef __target_clones
+#  ifdef __x86_64__
+#    define __target_clones \
+         __attribute__((noinline, target_clones("default", "avx2,fma", "avx512f")))
+#  else
+#    define __target_clones   /* 非 x86 无操作 */
+#  endif
+#endif
+
+__target_clones
+void compute_factor(const float *src, float *dst, int n) {
+    // 纯 C 循环——编译器为 avx2、avx512f、default 各生成一份
+    for (int i = 0; i < n; i++)
+        dst[i] = src[i] * alpha + beta;
+}
+```
+
+**`target_clones` 的 ISA 字符串**（用特性名，不是微架构级别名！`x86-64-v3`/`x86-64-v4` 在 GCC 的 target_clones 属性中不被接受）：
+
+| Clone 字符串 | 启用 |
+|-------------|------|
+| `"default"` | 基线（x86-64 上即 SSE2），**必须放最后作为 fallback** |
+| `"avx2,fma"` | AVX2 + FMA（Haswell+） |
+| `"avx512f"` | AVX-512F（Skylake-X / Ice Lake+） |
+
+#### 机制 B: `__builtin_cpu_supports`（手动分派）
+
+对手写 intrinsics 的多版本函数做显式 dispatch：
+
+```c
+typedef void (*compute_func)(const float*, float*, int);
+
+void compute_scalar(const float *src, float *dst, int n) { /* 标量实现 */ }
+
+void compute_avx2(const float *src, float *dst, int n) {
+    // __attribute__((target("avx2"))) 确保此函数只用 AVX2 指令
+    // 里面可以用 _mm256_* intrinsics
+}
+
+void compute_avx512(const float *src, float *dst, int n) {
+    // __attribute__((target("avx512f")))
+    // 里面可以用 _mm512_* intrinsics
+}
+
+// 启动时解析一次，存到函数指针
+compute_func resolve_compute(void) {
+    if (__builtin_cpu_supports("avx512f"))  return compute_avx512;
+    if (__builtin_cpu_supports("avx2"))     return compute_avx2;
+    return compute_scalar;
+}
+```
+
+**关键纪律**：
+- 每个 `_mm256_*` 版本的函数必须标注 `__attribute__((target("avx2")))`，`_mm512_*` 版本必须标注 `__attribute__((target("avx512f")))`。否则编译器可能在该函数内生成不支持的指令。
+- dispatch 解析只在启动时做一次，存到函数指针或 `std::function`（注意 `std::function` 有间接调用开销——热路径上直接调函数指针）。
+- **不要**用 `#ifdef __AVX2__` 做编译期条件编译：这样生成的二进制在非 AVX2 机器上会静默跑标量路径或直接崩。
+
+> 参考：`references/04-cpu-dispatch.md`
+
 > 参考：`references/03-prefetch-warmup-vectorization.md`
 
 ---
@@ -130,3 +208,4 @@ metadata:
 | `01-memory-pool.md` | 内存池实现与设计 |
 | `02-huge-pages.md` | 大页内存 |
 | `03-prefetch-warmup-vectorization.md` | 缓存预取、预热与向量化 |
+| `04-cpu-dispatch.md` | CPU 运行时分派：target_clones 与 __builtin_cpu_supports |
