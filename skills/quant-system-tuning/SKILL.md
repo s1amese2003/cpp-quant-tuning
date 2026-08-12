@@ -1,6 +1,6 @@
 ---
 name: quant-system-tuning
-description: 低延迟交易机的系统层调优 — CPU 亲和性与 NUMA、isolcpus/cpuset 核隔离、超线程处理、实时线程优先级(SCHED_FIFO)、中断(IRQ)绑定与隔离、C-State/P-State 与频率锁定、系统静默(nohz_full/rcu_nocbs)、内核参数与 BIOS 配置。Use for CPU pinning, taskset, isolcpus, cpuset, NUMA, numactl, hyper-threading, SCHED_FIFO, RT priority, IRQ affinity, C-states, turbo, tickless, nohz_full, kernel boot params, BIOS settings, jitter, 延迟抖动, 核隔离, 系统静默, or when latency measurements are noisy and the machine itself must be tuned first.
+description: 低延迟交易机的系统层调优 — CPU 亲和性与 NUMA、isolcpus/cpuset 核隔离、超线程处理、实时线程优先级(SCHED_FIFO)、中断(IRQ)绑定与隔离、TLB shootdown 与页表变更类内核特性、C-State/P-State 与频率锁定、系统静默(nohz_full/rcu_nocbs)、内核参数与 BIOS 配置。Use for CPU pinning, taskset, isolcpus, cpuset, NUMA, numactl, numa_balancing, hyper-threading, SCHED_FIFO, RT priority, IRQ affinity, IPI, TLB shootdown, THP, KSM, compaction, C-states, turbo, tickless, nohz_full, kernel boot params, BIOS settings, jitter, 延迟抖动, 核隔离, 系统静默, or when latency measurements are noisy and the machine itself must be tuned first.
 license: CC-BY-4.0
 metadata:
   version: "1.0.0"
@@ -126,10 +126,24 @@ vm.swappiness=0                 # 配合 mlockall
 vm.stat_interval=120            # 降低统计线程唤醒频率
 kernel.numa_balancing=0         # 关自动 NUMA 迁移
 transparent_hugepage=never      # 用显式 hugetlb 代替（见 quant-memory-simd）
+vm.compaction_proactiveness=0   # 关主动内存规整（Linux 5.9+）
 kernel.sched_rt_runtime_us=-1   # 谨慎：允许 RT 线程 100% 占核，需配合看门狗
 ```
 
 关闭：SELinux/AppArmor 的热路径审计、`auditd`、不必要的 `systemd` 定时器、`ksmd`、`kcompactd`。
+
+### 这几项为什么是同一件事：TLB Shootdown
+
+上面的 `numa_balancing` / `transparent_hugepage` / `compaction_proactiveness` / `ksmd` 不是四条独立的经验，它们**共享同一个危害机制**：都会变更页表，而 TLB 的跨核一致性**没有硬件协议**——内核必须发 IPI 让其他核执行 `INVLPG`，被通知的核无论在做什么都要停下来处理。**你的隔离核、`SCHED_FIFO`、忙轮询线程挡不住 IPI。**
+
+```bash
+# 按核对比 shootdown 计数；隔离核那一列应该基本不动
+watch -n5 -d "grep TLB /proc/interrupts"
+```
+
+典型案例：某核 TLB shootdown 计数异常暴涨，定位到自动 NUMA balancing（它靠周期性取消页面映射来采样访问位置），`sysctl -w kernel.numa_balancing=0` 后恢复。
+
+同机不要跑 GC 语言的进程（JVM/Go 会通过 `madvise` 大量归还内存）。应用侧的对应做法（`M_MMAP_MAX=0`、交易时段冻结地址空间）见 `quant-memory-simd` 第 4 节。
 
 ---
 
@@ -142,6 +156,9 @@ cyclictest -p 90 -t1 -a 8 -n -m -D 60 -h 200
 # 隔离核上是否还有中断/上下文切换
 watch -n1 'cat /proc/interrupts'
 perf stat -e context-switches,cpu-migrations,page-faults -C 8 -a sleep 10
+
+# TLB shootdown：隔离核那一列应基本不动（页表变更类内核特性是否真关干净了）
+watch -n5 -d 'grep TLB /proc/interrupts'
 
 # 确认绑核生效
 taskset -pc <PID>; ps -To pid,tid,psr,comm <PID>
@@ -163,6 +180,7 @@ numastat -p <PID>
 - [ ] 兄弟超线程已离线（或 SMT 全关）
 - [ ] governor = performance
 - [ ] `mlockall` + `swappiness=0` + 大页预留
+- [ ] 页表变更类特性全关（THP、numa_balancing、KSM、主动规整），`grep TLB /proc/interrupts` 隔离核列不增长
 - [ ] `cyclictest` 抖动达标后才开始测业务延迟
 - [ ] 所有配置写成脚本/ansible 并纳入版本控制（**手工敲过一遍的机器一定会漂移**）
 

@@ -15,6 +15,14 @@ metadata:
 
 任何优化建议如果牺牲了左边去换右边，必须显式说明并让用户确认。
 
+**由此派生出一条贯穿全部 skill 的操作原则：**
+
+> **宁可多占内存、宁可牺牲整体吞吐，也要把热路径上所有"延迟不确定"的操作提前到启动阶段做掉。**
+
+这与通用服务端优化的方向相反。通用服务追求内存占用小、按需分配、把资源还给系统；交易进程要的是**关键路径上不发生任何需要内核介入的事**——不缺页、不刷 TLB、不重新取指、不改频率。内存和吞吐是用来换确定性的筹码，不是要守住的指标。
+
+具体落地为四件事（全部见 `quant-memory-simd`）：启动时预分配并写一遍所有内存（消除小缺页）、周期性空跑冷路径（缓存预热）、交易时段冻结地址空间（避免 TLB shootdown）、热路径限制向量宽度（避免 AVX 降频）。
+
 ---
 
 ## 1. 先分路径，再谈优化
@@ -84,7 +92,7 @@ metadata:
 
 两条必须记住的例外：**自定义内存池会让 ASan 失明**（需手动 `__asan_poison_memory_region`）；**插桩构建的延迟数字一律作废**，性能必须回 Release 复测。
 
-完整方法见 `quant-perf-analysis` 第 13 节与 `references/11-sanitizers.md`。
+完整方法见 `quant-perf-analysis` 第 13 节与 `quant-perf-analysis/references/11-sanitizers.md`。
 
 ---
 
@@ -96,6 +104,7 @@ metadata:
 |---|---|
 | 写/改热路径 C++：数据布局、分支、内联、模板、循环、位运算、传参 | **`quant-latency-core`** |
 | 内存池、大页、对齐分配、预取、SIMD 向量化 | **`quant-memory-simd`** |
+| 延迟确定性四件套：消除缺页、缓存预热、TLB shootdown、AVX 降频 | **`quant-memory-simd`**（第 2/4/5/6b 节） |
 | 无锁队列、SPMC 共享内存、双缓冲、自旋锁、wait-free、协程、socket | **`quant-lockfree-ipc`** |
 | CPU 亲和、NUMA、隔离核、实时优先级、中断绑定、内核/BIOS 调优 | **`quant-system-tuning`** |
 | 性能分析：perf、TMA、Roofline、编译选项、看汇编、rdtsc 延迟测量 | **`quant-perf-analysis`** |
@@ -132,4 +141,7 @@ metadata:
 
 ## 参考资料
 
-所有 `references/` 内容源自《交易系统开发》（张智炫）笔记，见仓库根目录 `trading-system-notes-Chinese.md`。
+`references/` 的主体（带 AUTO-GENERATED 头的文件）源自《交易系统开发》（张智炫）笔记，见仓库根目录 `trading-system-notes-Chinese.md`。后续补充的手写篇目在各自文件头标注来源，目前包括：
+
+- Intel `performance-skills`（`linux-perf` / `performance-patterns`）—— 多核扩展性、汇编模式扫描、分支概率、并发反模式
+- Denis Bakhvalov《现代 CPU 上的性能分析与优化》—— 第 12.4 节低延迟调优技术（缺页、预热、TLB shootdown、AVX 降频）

@@ -98,8 +98,14 @@ foreach ($d in $skillDirs) {
 
     $body = [System.IO.File]::ReadAllText($skillMd, [System.Text.Encoding]::UTF8)
     $mentioned = @{}
-    foreach ($m in [regex]::Matches($body, '(?:references/)?([0-9]{2}-[a-z0-9-]+\.md)')) {
-        $mentioned[$m.Groups[1].Value] = $true
+    # A mention may be qualified with another skill's name (e.g.
+    # `quant-perf-analysis/references/03-compiler-optimization.md`). Those are
+    # cross-skill pointers and must not be resolved against this skill's own
+    # references/ directory.
+    foreach ($m in [regex]::Matches($body, '(?:([a-z0-9-]+)/)?(?:references/)?([0-9]{2}-[a-z0-9-]+\.md)')) {
+        $owner = $m.Groups[1].Value
+        if ($owner -and $owner -ne 'references' -and $owner -ne $d.Name) { continue }
+        $mentioned[$m.Groups[2].Value] = $true
     }
 
     $refDir = Join-Path $d.FullName 'references'

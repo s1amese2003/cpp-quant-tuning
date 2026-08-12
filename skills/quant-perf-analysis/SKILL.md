@@ -146,6 +146,7 @@ strace -c -p <PID>
 - `-march=native` 生成的二进制不能跨机器；生产用统一的目标微架构（如 `-march=skylake-avx512`）或运行时分派。
 - **PGO**：交易系统收益明显（分支布局按真实行情分布优化）。流程：`-fprofile-generate` → 用**真实回放行情**跑 → `-fprofile-use`。用合成数据做 PGO 会适得其反。
 - **静态链接**优于动态：消除 PLT 间接跳转、避免运行时符号解析、启动即确定。代价是二进制大、安全补丁要重编。交易系统通常选静态。
+- **`-mprefer-vector-width=128|256`**：`-O3 -march=native` 下编译器会自作主张把 `memcpy`、结构体拷贝、小循环向量化成 `zmm`——在 Skylake-SP ~ Ice Lake-SP 上触发降频数百 MHz 并持续到毫秒级，拖慢**后续所有代码**。热路径 target 限宽，冷路径不限。先 `lscpu` 确认世代：新 Intel 与 AMD Zen4+ 已无此问题（见 `quant-memory-simd` 6b）。
 
 ### 诊断
 
