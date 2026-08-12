@@ -1,6 +1,6 @@
 ---
 name: quant-perf-analysis
-description: 交易系统的性能测量与瓶颈定位 — Roofline 模型判定 memory-bound/core-bound、TMA 自顶向下分析、perf 事件采样、编译器优化选项与内建函数、检查生成的汇编、静态/动态链接、特殊硬件指令、基于 rdtsc/TSC 的时钟周期级延迟测量、交易系统性能指标(tick-to-trade、p99.9、抖动)。Use for perf, profiling, TMA, roofline, IPC, cache-misses, branch-misses, benchmark, latency measurement, rdtsc, TSC, percentile, p99, jitter, 火焰图, 汇编, compiler flags, godbolt, PGO, LTO, 性能瓶颈, 延迟测量, or before/after any optimization to prove it worked.
+description: 交易系统的性能测量与正确性诊断 — Roofline 模型判定 memory-bound/core-bound、TMA 自顶向下分析、perf 事件采样、编译器优化选项与内建函数、检查生成的汇编、静态/动态链接、特殊硬件指令、基于 rdtsc/TSC 的时钟周期级延迟测量、交易系统性能指标(tick-to-trade、p99.9、抖动)、Sanitizers(ASan/TSan/MSan/UBSan)强制插桩调试。Use for perf, profiling, TMA, roofline, IPC, cache-misses, branch-misses, benchmark, latency measurement, rdtsc, TSC, percentile, p99, jitter, 火焰图, 汇编, compiler flags, godbolt, PGO, LTO, 性能瓶颈, 延迟测量, or before/after any optimization to prove it worked. ALSO use for any memory error, data race, uninitialized read, or undefined behaviour: sanitizer, ASan, TSan, MSan, UBSan, AddressSanitizer, ThreadSanitizer, fsanitize, valgrind, use-after-free, 越界, 悬垂指针, 内存泄漏, 数据竞争, 未初始化, 未定义行为, segfault, 段错误, heap corruption, 偶发崩溃, 不可复现 — these MUST be reproduced under instrumentation, never diagnosed by reading code alone.
 license: CC-BY-4.0
 metadata:
   version: "1.0.0"
@@ -189,6 +189,7 @@ objdump -d --no-show-raw-insn -M intel binary | less
 - [ ] 跑过 `perf c2c` 排查 false sharing？
 - [ ] 关键函数的汇编亲眼看过？
 - [ ] 基准用的是真实行情回放？A/B 交替执行？
+- [ ] 涉及内存/并发/未初始化/UB 的结论，是 sanitizer 跑出来的还是读代码猜的？（见第 13 节）
 
 ---
 
@@ -478,6 +479,63 @@ else
 
 ---
 
+## 13. Sanitizers：正确性问题的强制第一步
+
+**硬性规则：内存错误、数据竞争、未初始化读取、未定义行为这四类问题，禁止只靠读代码下结论，必须用 sanitizer 实际跑出来。**
+
+这四类 bug 的共同特征是**症状与病因在时空上分离**——越界写坏的是别人的数据，几十万个 tick 之后才在别的模块崩溃；数据竞争只在特定核数与指令调度下暴露；未初始化读在 `-O0` 下碰巧是 0，`-O3` 下变成栈上残留的价格。代码审阅能提出假设，**不能证伪**。
+
+### 四种工具
+
+| Sanitizer | 编译选项 | 检测 | CPU 开销 | 兼容 |
+|---|---|---|---|---|
+| **ASan** | `-fsanitize=address` | 堆/栈/全局越界、use-after-free/return/scope、double free、泄漏(LSan) | ~2× | 可与 UBSan 同开 |
+| **TSan** | `-fsanitize=thread` | 数据竞争、锁序反转、线程泄漏 | 5–15× | **必须单独构建** |
+| **MSan** | `-fsanitize=memory` | 未初始化内存读取 | ~3× | **仅 Clang，单独构建，依赖须同样插桩** |
+| **UBSan** | `-fsanitize=undefined` | 有符号溢出、除零、空指针、错位对齐、移位越界、非法 bool/enum | 极低 | 可与 ASan 同开 |
+
+标准做法：维护 `build-asan`(+UBSan)、`build-tsan`、`build-msan` 三个独立目标，均用 `-g -O1 -fno-omit-frame-pointer -fno-sanitize-recover=all`，链接期也要带同样的 `-fsanitize`。
+
+### 症状 → 工具
+
+| 症状 | 用 |
+|---|---|
+| 段错误、偶发崩溃、字段被莫名改写、RSS 持续增长 | **ASan** |
+| 多线程结果不可复现、只在高核数出现、加 `printf` 就好了、序列号跳变 | **TSan** |
+| `-O0` 对 `-O2` 错、依赖编译器版本、定点价格偶现巨大/负值 | **UBSan** |
+| 读出来是垃圾值、Valgrind 报 uninitialised value | **MSan** |
+
+选错工具会得到"干净"的结果并据此做出错误结论：ASan 不查未初始化，MSan 不查越界，TSan 不查内存错误。
+
+### 强制工作流
+
+```
+0) 症状分类 → 选工具（不确定先 ASan+UBSan，再 TSan）
+1) 建插桩构建（与 Release 分离）
+2) 用真实回放行情复现；跑不出来 → 加线程/轮数、临时取消绑核与 SCHED_FIFO
+3) 读第一条报告（报告有级联，第 2 条常是第 1 条的后果）
+4) 只修第一条，附报告片段作为证据
+5) 复跑到 clean
+6) 回 Release 复测性能  ← 插桩构建的延迟数字一律作废
+7) 复现用例固化成回归测试，并入 CI 的 sanitizer job
+```
+
+**结论必须引用 sanitizer 的实际输出**（栈 + 地址 + shadow 字节 / 两个冲突访问的双栈）。没跑或跑不出来时，明确说明"未经插桩验证，以下是假设"。
+
+### 交易系统三个必须知道的坑
+
+1. **自定义内存池让 ASan 失明**——池内越界/UAF 它看不见。必须在 `acquire`/`release` 里手动 `__asan_unpoison_memory_region` / `__asan_poison_memory_region`，否则报告 clean 无意义。
+2. **TSan 理解 `std::atomic` 与 `memory_order`，但不理解手写内联汇编屏障**——自实现自旋锁会大量误报，用 `__tsan_acquire/__tsan_release` 标注同步边；`no_sanitize("thread")` 是承诺"已论证"，必须写明理由。
+3. **插桩构建绝不用于延迟测量**——TSan 改变延迟一个数量级并彻底改变线程交错，ASan 改变内存布局。插桩只回答"对不对"。
+
+生产可开的最小检查：`-fsanitize=undefined -fsanitize-trap=undefined -fsanitize-minimal-runtime`（<1%）+ `-D_GLIBCXX_ASSERTIONS`。UBSan 的 `signed-integer-overflow` 正好抓定点价格 × 数量的 `int64` 静默溢出。
+
+**Sanitizer 沉默 ≠ 无 bug**（只覆盖执行到的路径），它是必要条件不是充分条件；但没跑就断言"这里没有竞争/没有越界"，是没有依据的猜测。
+
+> 参考：`references/11-sanitizers.md`（完整选项、环境变量、抑制规则、CMake 集成、复现技巧）
+
+---
+
 ## references/ 索引
 
 | 文件 | 内容 |
@@ -492,3 +550,4 @@ else
 | `08-scaling-analysis.md` | 多核扩展性分析：sweep、双剖面对比、跳变函数识别与迭代 |
 | `09-annotate-pattern-scan.md` | Annotate 模式扫描：7 种汇编反模式的信号、置信度与修复方向 |
 | `10-branch-probability.md` | 分支概率测量：Intel PMU 事件与 GCC 静态估计 |
+| `11-sanitizers.md` | Sanitizers：ASan/TSan/MSan/UBSan 的选择、编译运行、内存池毒化、无锁代码注解、CI 集成 |

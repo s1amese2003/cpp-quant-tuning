@@ -67,6 +67,25 @@ metadata:
 
 系统层噪声未消除时测出的数字不可信 —— 先过一遍 `quant-system-tuning` 的静默清单，否则 p99 测的是调度器不是你的代码。
 
+### 正确性问题：Sanitizer 优先（硬性规则）
+
+**以下四类问题禁止只靠读代码下结论，必须用 sanitizer 插桩跑出来：**
+
+| 症状 | 工具 | 编译选项 |
+|---|---|---|
+| 越界、悬垂指针、use-after-free、double free、内存泄漏、偶发段错误 | **ASan** | `-fsanitize=address` |
+| 数据竞争、只在多核/高负载出现的不一致、序列号跳变 | **TSan**（单独构建） | `-fsanitize=thread` |
+| 读到未初始化内存、字段是垃圾值 | **MSan**（仅 Clang） | `-fsanitize=memory` |
+| 有符号溢出（定点价格×数量）、除零、错位对齐、移位越界、`-O0` 对 `-O2` 错 | **UBSan** | `-fsanitize=undefined` |
+
+统一加 `-g -O1 -fno-omit-frame-pointer -fno-sanitize-recover=all`，链接期同样带上。
+
+理由：这四类 bug 的症状与病因在时空上分离，代码审阅只能提出假设、**不能证伪**。因此结论必须引用 sanitizer 的实际输出（栈 + 地址 + shadow 字节 / 冲突访问双栈）；未插桩验证时必须写明"以下是假设"。
+
+两条必须记住的例外：**自定义内存池会让 ASan 失明**（需手动 `__asan_poison_memory_region`）；**插桩构建的延迟数字一律作废**，性能必须回 Release 复测。
+
+完整方法见 `quant-perf-analysis` 第 13 节与 `references/11-sanitizers.md`。
+
 ---
 
 ## 4. 路由表
@@ -80,6 +99,7 @@ metadata:
 | 无锁队列、SPMC 共享内存、双缓冲、自旋锁、wait-free、协程、socket | **`quant-lockfree-ipc`** |
 | CPU 亲和、NUMA、隔离核、实时优先级、中断绑定、内核/BIOS 调优 | **`quant-system-tuning`** |
 | 性能分析：perf、TMA、Roofline、编译选项、看汇编、rdtsc 延迟测量 | **`quant-perf-analysis`** |
+| 正确性诊断：内存错误、数据竞争、未初始化读、UB → Sanitizers 插桩调试 | **`quant-perf-analysis`**（第 13 节） |
 | 行情/交易数据处理：流合并、增量计算、csv↔binary、脏数据、时序竞争、盯市 | **`quant-market-data`** |
 | 业务组件设计：OMS、订单簿、FIX、撮合、K线、SOR、限流、自成交保护、协议 | **`quant-trading-systems`** |
 | 策略与数值：收益率、波动率状态、EMA、正则化模型、参数寻优、置换检验、做市、定点数 | **`quant-strategy-math`** |
